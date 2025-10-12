@@ -11,6 +11,11 @@
 #include <linux/semaphore.h>
 #include <linux/device.h>
 #include <linux/uaccess.h>
+#include <linux/capability.h>  // for capable()
+
+#include "buf_ioctl.h"
+
+
 
 #define READWRITE_BUFSIZE 16
 #define DEFAULT_BUFSIZE 256
@@ -549,6 +554,132 @@ ssize_t buf_write(struct file *filp, const char __user *ubuf, size_t count, loff
   return total_bytes_written;
 }
 
+
+//arg : an argument passed from user space (usually a pointer to data).
 long buf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
-  return 0; // stub
+  struct Buf_Dev *dev = filp->private_data;
+  int err = 0;
+  int retval = 0;
+  int tmp;
+
+  /* check magic number and command */
+  if (_IOC_TYPE(cmd) != BUF_IOC_MAGIC) //should match your device magic number
+    return -ENOTTY;
+  if (_IOC_NR(cmd) > BUF_IOC_MAXNR) //must not exceed the highest defined command.
+    return -ENOTTY;
+
+  /* check user memory access : checks if user-space pointer arg is valid and accessible */
+  // _IOC_DIR(cmd) : determines if IOCTL reads or writes data.
+  // access_ok() : returns true if memory is accessible to kernel.
+  if (_IOC_DIR(cmd) & _IOC_READ) //
+    err = !access_ok((void __user *)arg, _IOC_SIZE(cmd));
+  else if (_IOC_DIR(cmd) & _IOC_WRITE)
+    err = !access_ok((void __user *)arg, _IOC_SIZE(cmd));
+  if (err) // If invalid :  return -EFAULT (bad memory address).
+    return -EFAULT;
+
+  // Handles the different IOCTL commands
+  switch(cmd) {
+    // Get number of data items currently in the buffer
+    case BUF_IOCGETNUMDATA:
+      // Tries to lock the semaphore protecting the buffer.
+      if (down_trylock(&dev->SemBuf)){
+        printk(KERN_WARNING "buf: (buf_ioctl) could not lock semaphore for BUF_IOCGETNUMDATA\n");
+        return -EAGAIN; // non-blocking
+      }
+      // Calculate number of data items in the buffer
+      // If the buffer is full, the number of items equals the buffer size.
+      if (Buffer.BufFull)
+        tmp = Buffer.BufSize;
+      // If not full, it calculates the difference between InIdx and OutIdx, adjusted for wrap-around using modulo.
+      else
+        tmp = (Buffer.InIdx - Buffer.OutIdx + Buffer.BufSize) % Buffer.BufSize;
+      // Releases the semaphore.
+      up(&dev->SemBuf);
+      //arg is just a number (an address in user-space memory).
+      // By casting it, we interpret that number as a pointer to an int in user spac
+      // exemple : int ret = ioctl(fd, BUF_IOCGETNUMDATA, &numdata); in userspace code
+      if (copy_to_user((int __user *)arg, &tmp, sizeof(int)))
+        return -EFAULT;
+      break;
+
+    case BUF_IOCGETNUMREADER:
+      if (down_trylock(&dev->SemBuf)) 
+        return -EAGAIN;
+      tmp = dev->numReader;
+      up(&dev->SemBuf);
+      if (copy_to_user((int __user *)arg, &tmp, sizeof(int)))
+        return -EFAULT;
+      break;
+
+    case BUF_IOCGETBUFSIZE:
+      tmp = Buffer.BufSize;
+      if (copy_to_user((int __user *)arg, &tmp, sizeof(int)))
+        return -EFAULT;
+      break;
+
+    case BUF_IOCSETBUFSIZE:
+      // Only allow if user has modify capabilities (is admin)
+      if (!capable(CAP_SYS_RESOURCE))
+        return -EPERM;  // only admin
+      // ACQUIRE SEMAPHORE
+      if (down_trylock(&dev->SemBuf)) 
+        return -EAGAIN;
+      // Get new buffer size from user
+      // copy the integer value from user space (pointed to by arg) into tmp.
+      if (get_user(tmp, (int __user *)arg)) {
+        // if not successful, release semaphore and return -EFAULT
+        up(&dev->SemBuf);
+        return -EFAULT;
+      }
+      // Validate new size
+      //If the new size (tmp) is smaller than the number of items already in the buffer, we cannot shrink.
+      // if buffer is full, we have BufSize items
+      // else we have (InIdx - OutIdx + BufSize) % BufSize items
+      // (Buffer.BufFull ? Buffer.BufSize : (Buffer.InIdx - Buffer.OutIdx + Buffer.BufSize) % Buffer.BufSize)
+      if (tmp < (Buffer.BufFull ? Buffer.BufSize : (Buffer.InIdx - Buffer.OutIdx + Buffer.BufSize) % Buffer.BufSize)) {
+        // Release semaphore
+        up(&dev->SemBuf);
+        return -EINVAL; // cannot shrink below current data
+      }
+
+      //Allocates a new buffer in kernel memory of size tmp (the new requested buffer size) multiplied by sizeof(unsigned short)
+      unsigned short *newbuf = kmalloc(tmp * sizeof(unsigned short), GFP_KERNEL);
+      // Check if allocation succeeded
+      if (!newbuf) {
+        // Allocation failed, release semaphore and return
+        up(&dev->SemBuf);
+        return -ENOMEM;
+      }
+
+      // CALCULATE how many data items are currently in the buffer
+      int ndata = Buffer.BufFull ? Buffer.BufSize : (Buffer.InIdx - Buffer.OutIdx + Buffer.BufSize) % Buffer.BufSize;
+      // Copy existing data to new buffer
+      for (int i = 0; i < ndata; i++){
+        newbuf[i] = Buffer.Buffer[(Buffer.OutIdx + i) % Buffer.BufSize];
+      }
+      // Update Buffer structure to use new buffer
+      // Free old buffer memory
+      kfree(Buffer.Buffer);
+      // Update Buffer to point to new buffer
+      Buffer.Buffer = newbuf;
+      // buffer size is now updated to tmp
+      Buffer.BufSize = tmp;
+      // indices are reset: InIdx points to the end of the copied data,
+      Buffer.InIdx = ndata;
+      // OutIdx is reset to 0
+      Buffer.OutIdx = 0;
+      // Update full/empty flags
+      Buffer.BufFull = (ndata == Buffer.BufSize);
+      Buffer.BufEmpty = (ndata == 0);
+
+      // RELEASE SEMAPHORE
+      up(&dev->SemBuf);
+      break;
+
+    default:
+        return -ENOTTY;
+  }
+
+  return retval;
 }

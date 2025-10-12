@@ -1,8 +1,24 @@
-bin/*.o
-bin/*.mod*
-*.symvers
-*.order
+# Ignore all build artifacts
+*.o
+*.mod
+*.mod.c
+*.mod.o
 *.ko
+*.order
+*.symvers
 *.cmd
 *.tmp
+
+# bin: keep only final files
+bin/*
 !bin/buf_driver.ko
+!bin/test_app
+
+# src/app: track everything
+# (nothing to ignore)
+
+# src/driver: ignore all except these
+src/driver/*
+!src/driver/buf_driver.c
+!src/driver/buf_ioctl.h
+!src/driver/Makefile
