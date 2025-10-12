@@ -5,3 +5,4 @@ bin/*.mod*
 *.ko
 *.cmd
 *.tmp
+!bin/buf_driver.ko
